@@ -21,6 +21,10 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
 
   val height = 2 * 16 // 32 bit in an int
 
+  // 3D texture dimensions (no less than hologram dimensions, must be powers of 2)
+  val texWidth = 4 * 16
+  val texHeight = 2 * 16
+
   // Layout is: first half is lower bit, second half is higher bit for the
   // voxels in the cube. This is to retain compatibility with pre 1.3 saves.
   val volume = new Array[Int](width * width * 2)
@@ -34,10 +38,6 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
   // Whether we need to send an update packet/recompile our display list.
   var dirty = false
 
-  // Store it here for convenience, this is the number of visible voxel faces
-  // as determined in the last VBO index update. See HologramRenderer.
-  var visibleQuads = 0
-
   // Interval of dirty columns.
   var dirtyFromX = Int.MaxValue
   var dirtyUntilX = -1
@@ -49,7 +49,7 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
 
   var hasPower = true
 
-  val colorsByTier = Array(Array(0x00FF00), Array(0x0000FF, 0x00FF00, 0xFF0000)) // 0xBBGGRR for rendering convenience
+  val colorsByTier = Array(Array(0x00FF00), Array(0xFF0000, 0x00FF00, 0x0000FF)) // 0xRRGGBB as always
 
   // This is a def and not a val for loading (where the tier comes from the nbt and is always 0 here).
   def colors = colorsByTier(tier)
@@ -200,7 +200,7 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
 
   @Callback(doc = """function(value:number) -- Set the render scale. A larger scale consumes more energy.""")
   def setScale(computer: Context, args: Arguments): Array[AnyRef] = {
-    scale = math.max(0.333333, math.min(Settings.hologramMaxScaleByTier(tier), args.checkDouble(0)))
+    scale = math.max(1/3f, math.min(Settings.hologramMaxScaleByTier(tier), args.checkDouble(0)))
     ServerPacketSender.sendHologramScale(this)
     null
   }
@@ -209,8 +209,7 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
   def getPaletteColor(computer: Context, args: Arguments): Array[AnyRef] = {
     val index = args.checkInteger(0)
     if (index < 0 || index >= colors.length) throw new ArrayIndexOutOfBoundsException()
-    // Colors are stored as 0xAABBGGRR for rendering convenience, so convert them.
-    result(convertColor(colors(index)))
+    result(colors(index))
   }
 
   @Callback(doc = """function(index:number, value:number):number -- Set the color defined for the specified value.""")
@@ -219,9 +218,7 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
     if (index < 0 || index >= colors.length) throw new ArrayIndexOutOfBoundsException()
     val value = args.checkInteger(1)
     val oldValue = colors(index)
-    // Change byte order here to allow passing stored color to OpenGL "as-is"
-    // (as whole Int, i.e. 0xAABBGGRR, alpha is unused but present for alignment)
-    colors(index) = convertColor(value)
+    colors(index) = value
     ServerPacketSender.sendHologramColor(this, index, value)
     result(oldValue)
   }
@@ -244,10 +241,6 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
         args.checkInteger(index)
     if (value < 0 || value > colors.length) throw new IllegalArgumentException("invalid value")
     value
-  }
-
-  private def convertColor(color: Int) = {
-    ((color & 0x0000FF) << 16) | (color & 0x00FF00) | ((color & 0xFF0000) >>> 16)
   }
 
   // ----------------------------------------------------------------------- //
@@ -298,7 +291,7 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
     tier = nbt.getByte(Settings.namespace + "tier") max 0 min 1
     super.readFromNBT(nbt)
     nbt.getIntArray(Settings.namespace + "volume").copyToArray(volume)
-    nbt.getIntArray(Settings.namespace + "colors").map(convertColor).copyToArray(colors)
+    nbt.getIntArray(Settings.namespace + "colors").copyToArray(colors)
     scale = nbt.getDouble(Settings.namespace + "scale")
   }
 
@@ -306,7 +299,7 @@ class Hologram(var tier: Int) extends traits.Environment with SidedEnvironment w
     nbt.setByte(Settings.namespace + "tier", tier.toByte)
     super.writeToNBT(nbt)
     nbt.setIntArray(Settings.namespace + "volume", volume)
-    nbt.setIntArray(Settings.namespace + "colors", colors.map(convertColor))
+    nbt.setIntArray(Settings.namespace + "colors", colors)
     nbt.setDouble(Settings.namespace + "scale", scale)
   }
 

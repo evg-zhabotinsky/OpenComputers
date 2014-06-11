@@ -9,11 +9,11 @@ import li.cil.oc.common.tileentity.Hologram
 import li.cil.oc.util.RenderState
 import net.minecraft.client.renderer.tileentity.TileEntitySpecialRenderer
 import net.minecraft.tileentity.TileEntity
-import org.lwjgl.opengl.{GL15, GL11}
+import org.lwjgl.opengl._
 import scala.util.Random
 import org.lwjgl.BufferUtils
-import li.cil.oc.Settings
-import java.nio.IntBuffer
+import li.cil.oc.{OpenComputers, Settings}
+import java.nio.ByteBuffer
 
 object HologramRenderer extends TileEntitySpecialRenderer with Callable[Int] with RemovalListener[TileEntity, Int] with ITickHandler {
   private val random = new Random()
@@ -27,25 +27,20 @@ object HologramRenderer extends TileEntitySpecialRenderer with Callable[Int] wit
 
   /**
    * Common for all holograms. Holds the vertex positions, texture
-   * coordinates and normals information. Layout is: u v nx ny nz x y z
+   * coordinates and normals information. Layout is: (u v) (s t p) (nx ny nz) (x y z)
    *
-   * WARNING: this optimization only works if all the holograms have the
+   * NOTE: this optimization only works if all the holograms have the
    * same dimensions (in voxels). If we ever need holograms of different
    * sizes we could probably just fake that by making the outer layers
    * immutable (i.e. always empty).
-   *
-   * NOTE: It already takes up 47.25 MiB of video memory and increasing
-   * hologram size to, for example, 64*64*64 will result in 168 MiB.
    */
   private var commonBuffer = 0
 
   /**
-   * Also common for all holograms. Temporary buffer used to upload
-   * hologram data to GPU. First half stores colors for each vertex
-   * (0xAABBGGRR Int, alpha is used for alignment only) and second
-   * half stores (Int) indices of vertices that should be drawn.
+   * Also common for all holograms. Temporary buffers used to upload
+   * hologram data to GPU. Store voxel colors (RGBA 4-byte format)
    */
-  private var dataBuffer: IntBuffer = null
+  private var dataBuffer: ByteBuffer = null
 
   /** Used to pass the current screen along to call(). */
   private var hologram: Hologram = null
@@ -80,36 +75,14 @@ object HologramRenderer extends TileEntitySpecialRenderer with Callable[Int] wit
     // After the below scaling, hologram is drawn inside a [0..48]x[0..32]x[0..48] box
     GL11.glScaled(hologram.scale / 16f, hologram.scale / 16f, hologram.scale / 16f)
 
-    bindTexture(Textures.blockHologram)
-
     // Normalize normals (yes, glScale scales them too).
     GL11.glEnable(GL11.GL_NORMALIZE)
 
-    val sx = (x + 0.5) * hologram.scale
-    val sy = -(y + 0.5) * hologram.scale
-    val sz = (z + 0.5) * hologram.scale
-    if (sx >= -1.5 && sx <= 1.5 && sz >= -1.5 && sz <= 1.5 && sy >= 0 && sy <= 2) {
-      // Camera is inside the hologram.
-      GL11.glDisable(GL11.GL_CULL_FACE)
-    }
-    else {
-      // Camera is outside the hologram.
-      GL11.glEnable(GL11.GL_CULL_FACE)
-      GL11.glCullFace(GL11.GL_BACK)
-    }
+    GL11.glEnable(GL11.GL_CULL_FACE)
+    GL11.glCullFace(GL11.GL_BACK)
 
-    // We do two passes here to avoid weird transparency effects: in the first
-    // pass we find the front-most fragment, in the second we actually draw it.
-    // When we don't do this the hologram will look different from different
-    // angles (because some faces will shine through sometimes and sometimes
-    // they won't), so a more... consistent look is desirable.
-    val glBuffer = cache.get(hologram, this)
-    GL11.glColorMask(false, false, false, false)
-    GL11.glDepthMask(true)
-    draw(glBuffer)
-    GL11.glColorMask(true, true, true, true)
-    GL11.glDepthFunc(GL11.GL_EQUAL)
-    draw(glBuffer)
+    val holoTexture3D = cache.get(hologram, this)
+    draw(holoTexture3D)
 
     GL11.glPopMatrix()
     GL11.glPopAttrib()
@@ -118,78 +91,125 @@ object HologramRenderer extends TileEntitySpecialRenderer with Callable[Int] wit
     RenderState.checkError(getClass.getName + ".renderTileEntityAt: leaving")
   }
 
-  def draw(glBuffer: Int) {
+  def draw(holoTexture3D: Int) {
+    RenderState.checkError(getClass.getName + ".draw: entering (aka: wasntme)")
     initialize()
-    validate(glBuffer)
-    publish(glBuffer)
+    RenderState.checkError(getClass.getName + ".draw: initialize")
+    validate(holoTexture3D)
+    RenderState.checkError(getClass.getName + ".draw: validate")
+    publish(holoTexture3D)
+    RenderState.checkError(getClass.getName + ".draw: publish")
   }
 
   private def initialize() {
     // First run only, create structure information.
     if (commonBuffer == 0) {
-      dataBuffer = BufferUtils.createIntBuffer(hologram.width * hologram.width * hologram.height * 6 * 4 * 2)
+      // Using max() for clarity. First argument is definitely larger. (1 + 3) is (no cube) + 3 palette colors.
+      dataBuffer = BufferUtils.createByteBuffer(math.max(hologram.width * hologram.width * hologram.height * 4, (1 + 3) * 4))
 
       commonBuffer = GL15.glGenBuffers()
 
-      val data = BufferUtils.createFloatBuffer(hologram.width * hologram.width * hologram.height * 24 * (2 + 3 + 3))
-      def addVertex(x: Int, y: Int, z: Int, u: Int, v: Int, nx: Int, ny: Int, nz: Int) {
+      // Layout is: (u v) (s t p) (nx ny nz) (x y z)
+      val data = BufferUtils.createFloatBuffer((hologram.width + hologram.width + hologram.height) * 2 * 4 * (2 + 3 + 3 + 3))
+
+      // Stuff to add vertices "conveniently". Might be done better but I don't know Scala well enough.
+      var nx: Float = 0
+      var ny: Float = 0
+      var nz: Float = 0
+      def setNormal(x: Float, y: Float, z: Float) {
+        nx = x
+        ny = y
+        nz = z
+      }
+      def addVertex(x: Float, y: Float, z: Float, u: Float, v: Float, s: Float, t: Float, p: Float) {
         data.put(u)
         data.put(v)
+        data.put(s)
+        data.put(t)
+        data.put(p)
         data.put(nx)
         data.put(ny)
         data.put(nz)
         data.put(x)
         data.put(y)
         data.put(z)
+        OpenComputers.log.info("# "+u+" "+v+" "+s+" "+t+" "+p+" "+nx+" "+ny+" "+nz+" "+x+" "+y+" "+z)
       }
 
-      for (x <- 0 until hologram.width) {
-        for (z <- 0 until hologram.width) {
-          for (y <- 0 until hologram.height) {
-            /*
-                  0---1
-                  | N |
-              0---3---2---1---0
-              | W | U | E | D |
-              5---6---7---4---5
-                  | S |
-                  5---4
-             */
+      /**
+       * Render hologram as 6 plane piles, each of which
+       * covers one side of all cubes. Cube sides are as follows:
+       *     0---1
+       *     | N |
+       * 0---3---2---1---0
+       * | W | U | E | D |
+       * 5---6---7---4---5
+       *     | S |
+       *     5---4
+       */
 
-            // South
-            addVertex(x + 1, y + 1, z + 1, 0, 0, 0, 0, 1) // 5
-            addVertex(x + 0, y + 1, z + 1, 1, 0, 0, 0, 1) // 4
-            addVertex(x + 0, y + 0, z + 1, 1, 1, 0, 0, 1) // 7
-            addVertex(x + 1, y + 0, z + 1, 0, 1, 0, 0, 1) // 6
-            // North
-            addVertex(x + 1, y + 0, z + 0, 0, 0, 0, 0, -1) // 3
-            addVertex(x + 0, y + 0, z + 0, 1, 0, 0, 0, -1) // 2
-            addVertex(x + 0, y + 1, z + 0, 1, 1, 0, 0, -1) // 1
-            addVertex(x + 1, y + 1, z + 0, 0, 1, 0, 0, -1) // 0
+      val dw = 1f / hologram.texWidth
+      val dh = 1f / hologram.texHeight
+      val hw = hologram.width
+      val hh = hologram.height
+      val tw = dw * hw
+      val th = dh * hh
 
-            // East
-            addVertex(x + 1, y + 1, z + 1, 1, 0, 1, 0, 0) // 5
-            addVertex(x + 1, y + 0, z + 1, 1, 1, 1, 0, 0) // 6
-            addVertex(x + 1, y + 0, z + 0, 0, 1, 1, 0, 0) // 3
-            addVertex(x + 1, y + 1, z + 0, 0, 0, 1, 0, 0) // 0
-            // West
-            addVertex(x + 0, y + 0, z + 1, 1, 0, -1, 0, 0) // 7
-            addVertex(x + 0, y + 1, z + 1, 1, 1, -1, 0, 0) // 4
-            addVertex(x + 0, y + 1, z + 0, 0, 1, -1, 0, 0) // 1
-            addVertex(x + 0, y + 0, z + 0, 0, 0, -1, 0, 0) // 2
+      // South
+      setNormal(0, 0, 1)
+      for (z <- 1 to hologram.width) {
+        val tz = (z - .5f) * dw
+        addVertex(hw, hh, z , hw, hh, tw, th, tz) // 5
+        addVertex(0 , hh, z , 0 , hh, 0 , th, tz) // 4
+        addVertex(0 , 0 , z , 0 , 0 , 0 , 0 , tz) // 7
+        addVertex(hw, 0 , z , hw, 0 , tw, 0 , tz) // 6
+      }
+      // North
+      setNormal(0, 0, -1)
+      for (z <- hologram.width-1 to 0 by -1) {
+        val tz = (z + .5f) * dw
+        addVertex(hw, 0 , z , 0 , 0 , tw, 0 , tz) // 3
+        addVertex(0 , 0 , z , hw, 0 , 0 , 0 , tz) // 2
+        addVertex(0 , hh, z , hw, hh, 0 , th, tz) // 1
+        addVertex(hw, hh, z , 0 , hh, tw, th, tz) // 0
+      }
 
-            // Up
-            addVertex(x + 1, y + 1, z + 0, 0, 0, 0, 1, 0) // 0
-            addVertex(x + 0, y + 1, z + 0, 1, 0, 0, 1, 0) // 1
-            addVertex(x + 0, y + 1, z + 1, 1, 1, 0, 1, 0) // 4
-            addVertex(x + 1, y + 1, z + 1, 0, 1, 0, 1, 0) // 5
-            // Down
-            addVertex(x + 1, y + 0, z + 1, 0, 0, 0, -1, 0) // 6
-            addVertex(x + 0, y + 0, z + 1, 1, 0, 0, -1, 0) // 7
-            addVertex(x + 0, y + 0, z + 0, 1, 1, 0, -1, 0) // 2
-            addVertex(x + 1, y + 0, z + 0, 0, 1, 0, -1, 0) // 3
-          }
-        }
+      // East
+      setNormal(1, 0, 0)
+      for (x <- 1 to hologram.width) {
+        val tx = (x - .5f) * dw
+        addVertex(x , hh, hw, 0 , hh, tx, th, tw) // 5
+        addVertex(x , 0 , hw, 0 , 0 , tx, 0 , tw) // 6
+        addVertex(x , 0 , 0 , hw, 0 , tx, 0 , 0 ) // 3
+        addVertex(x , hh, 0 , hw, hh, tx, th, 0 ) // 0
+      }
+      // West
+      setNormal(-1, 0, 0)
+      for (x <- hologram.width-1 to 0 by -1) {
+        val tx = (x + .5f) * dw
+        addVertex(x , 0 , hw, hw, 0 , tx, 0 , tw) // 7
+        addVertex(x , hh, hw, hw, hh, tx, th, tw) // 4
+        addVertex(x , hh, 0 , 0 , hh, tx, th, 0 ) // 1
+        addVertex(x , 0 , 0 , 0 , 0 , tx, 0 , 0 ) // 2
+      }
+
+      // Up
+      setNormal(0, 1, 0)
+      for (y <- 1 to hologram.height) {
+        val ty = (y - .5f) * dh
+        addVertex(hw, y , 0 , 0 , hw, tw, ty, 0 ) // 0
+        addVertex(0 , y , 0 , hw, hw, 0 , ty, 0 ) // 1
+        addVertex(0 , y , hw, hw, 0 , 0 , ty, tw) // 4
+        addVertex(hw, y , hw, 0 , 0 , tw, ty, tw) // 5
+      }
+      // Down
+      setNormal(0, -1, 0)
+      for (y <- hologram.height-1 to 0 by -1) {
+        val ty = (y + .5f) * dh
+        addVertex(hw, y , hw, 0 , 0 , tw, ty, tw) // 6
+        addVertex(0 , y , hw, hw, 0 , 0 , ty, tw) // 7
+        addVertex(0 , y , 0 , hw, hw, 0 , ty, 0 ) // 2
+        addVertex(hw, y , 0 , 0 , hw, tw, ty, 0 ) // 3
       }
 
       // Important! OpenGL will start reading from the current buffer position.
@@ -201,94 +221,37 @@ object HologramRenderer extends TileEntitySpecialRenderer with Callable[Int] wit
     }
   }
 
-  private def validate(glBuffer: Int) {
-    // Refresh indexes when the hologram's data changed.
+  private def validate(holoTexture3D: Int) {
+    // Refresh 3D texture when the hologram's data changed.
     if (hologram.dirty) {
       def value(hx: Int, hy: Int, hz: Int) = if (hx >= 0 && hy >= 0 && hz >= 0 && hx < hologram.width && hy < hologram.height && hz < hologram.width) hologram.getColor(hx, hy, hz) else 0
 
-      def isSolid(hx: Int, hy: Int, hz: Int) = value(hx, hy, hz) != 0
-
-      def addFace(index: Int, color: Int) {
-        dataBuffer.put(index)
-        dataBuffer.put(index + 1)
-        dataBuffer.put(index + 2)
-        dataBuffer.put(index + 3)
-
-        dataBuffer.put(index, color)
-        dataBuffer.put(index + 1, color)
-        dataBuffer.put(index + 2, color)
-        dataBuffer.put(index + 3, color)
-
-        hologram.visibleQuads += 1
-      }
-
-      // Copy color information, identify which quads to render and prepare data for glDrawElements
-      hologram.visibleQuads = 0
-      var index = 0
-      dataBuffer.position(hologram.width * hologram.width * hologram.height * 6 * 4)
+      // Copy color information. Use ByteBuffer to avoid thinking about endianness.
+      // Only need to update dirty interval.
       for (hx <- 0 until hologram.width) {
-        for (hz <- 0 until hologram.width) {
-          for (hy <- 0 until hologram.height) {
-            // Do we need to draw at least one face?
-            if (isSolid(hx, hy, hz)) {
-              // Yes, get the color of the voxel.
-              val color = hologram.colors(value(hx, hy, hz) - 1)
-
-              // South
-              if (!isSolid(hx, hy, hz + 1)) {
-                addFace(index, color)
-              }
-              index += 4
-              // North
-              if (!isSolid(hx, hy, hz - 1)) {
-                addFace(index, color)
-              }
-              index += 4
-
-              // East
-              if (!isSolid(hx + 1, hy, hz)) {
-                addFace(index, color)
-              }
-              index += 4
-              // West
-              if (!isSolid(hx - 1, hy, hz)) {
-                addFace(index, color)
-              }
-              index += 4
-
-              // Up
-              if (!isSolid(hx, hy + 1, hz)) {
-                addFace(index, color)
-              }
-              index += 4
-              // Down
-              if (!isSolid(hx, hy - 1, hz)) {
-                addFace(index, color)
-              }
-              index += 4
-            }
-            else {
-              // No, skip all associated indices.
-              index += 6 * 4
+        for (hy <- 0 until hologram.height) {
+          for (hz <- 0 until hologram.width) {
+            val v = value(hx, hy, hz)
+            if (v == 0) { // No voxel here. (i.e. absolutely transparent voxel)
+              dataBuffer.put(0.toByte) // R
+              dataBuffer.put(0.toByte) // G
+              dataBuffer.put(0.toByte) // B
+              dataBuffer.put(0.toByte) // A
+            } else { // Voxel present. (Treat is there as absolutely opaque)
+              val color = hologram.colors(v - 1)
+              dataBuffer.put(((color >>> 16) & 0xFF).toByte) // R
+              dataBuffer.put(((color >>> 8) & 0xFF).toByte) // G
+              dataBuffer.put((color & 0xFF).toByte) // B
+              dataBuffer.put(0xFF.toByte) // A
             }
           }
         }
       }
+      dataBuffer.flip()
 
-      GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, glBuffer)
-      if (hologram.visibleQuads > 0) {
-        // Flip the buffer to only fill in as much data as necessary.
-        dataBuffer.flip()
-
-        // This buffer can be updated quite frequently, so dynamic seems sensible.
-        GL15.glBufferData(GL15.GL_ARRAY_BUFFER, dataBuffer, GL15.GL_DYNAMIC_DRAW)
-      }
-      else {
-        // Empty hologram.
-        GL15.glBufferData(GL15.GL_ARRAY_BUFFER, 0L, GL15.GL_DYNAMIC_DRAW)
-      }
-
-      println("HOLOGRAM SIZE: " + GL15.glGetBufferParameteri(GL15.GL_ARRAY_BUFFER, GL15.GL_BUFFER_SIZE) / 1024.0 / 1024.0)
+      GL11.glBindTexture(GL12.GL_TEXTURE_3D, holoTexture3D)
+      GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 1)
+      GL12.glTexSubImage3D(GL12.GL_TEXTURE_3D, 0, 0, 0, 0, hologram.width, hologram.height, hologram.width, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, dataBuffer)
 
       // Reset for the next operation.
       dataBuffer.clear()
@@ -297,19 +260,48 @@ object HologramRenderer extends TileEntitySpecialRenderer with Callable[Int] wit
     }
   }
 
-  private def publish(glBuffer: Int) {
-    GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, commonBuffer)
-    GL11.glEnableClientState(GL11.GL_VERTEX_ARRAY)
+  private def publish(holoTexture3D: Int) {
+    // Prepare geometry arrays and textures
+
+    GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, commonBuffer) // Layout: (u v) (s t p) (nx ny nz) (x y z)
+
+    //GL11.glTexCoordPointer(2, GL11.GL_FLOAT, (2+3+3+3)*4, 0) // (u v) coordinates for striped overlay
+    //GL11.glEnableClientState(GL11.GL_TEXTURE_COORD_ARRAY)
+
+    //GL13.glClientActiveTexture(GL13.GL_TEXTURE1) // Switch to second texture (for array manipulation)
+    GL11.glTexCoordPointer(3, GL11.GL_FLOAT, (2+3+3+3)*4, 2*4) // (s t p) coordinates for hologram contents
     GL11.glEnableClientState(GL11.GL_TEXTURE_COORD_ARRAY)
+
+    GL11.glNormalPointer(GL11.GL_FLOAT, (2+3+3+3)*4, (2+3)*4) // Normals for lighting
     GL11.glEnableClientState(GL11.GL_NORMAL_ARRAY)
-    GL11.glInterleavedArrays(GL11.GL_T2F_N3F_V3F, 0, 0)
 
-    GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, glBuffer)
-    GL11.glEnableClientState(GL11.GL_COLOR_ARRAY)
-    GL11.glColorPointer(3, GL11.GL_UNSIGNED_BYTE, 4, 0)
+    GL11.glVertexPointer(3, GL11.GL_FLOAT, (2+3+3+3)*4, (2+3+3)*4) // Vertex coordinates
+    GL11.glEnableClientState(GL11.GL_VERTEX_ARRAY)
 
-    GL15.glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, glBuffer)
-    GL11.glDrawElements(GL11.GL_QUADS, hologram.visibleQuads * 4, GL11.GL_UNSIGNED_INT, hologram.width * hologram.width * hologram.height * 6 * 4 * 4)
+    //bindTexture(Textures.blockHologram)
+
+    //GL13.glActiveTexture(GL13.GL_TEXTURE1) // Switch to second texture (for most configuration)
+    GL11.glEnable(GL12.GL_TEXTURE_3D)
+    GL11.glBindTexture(GL12.GL_TEXTURE_3D, holoTexture3D)
+    GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL11.GL_MODULATE)
+
+    GL11.glColor4f(1,1,1,1) // Works like color filter - don't know how to disable so make it do nothing
+
+    // We do two passes here to avoid weird transparency effects: in the first
+    // pass we find the front-most fragment, in the second we actually draw it.
+    // When we don't do this the hologram will look different from different
+    // angles (because some faces will shine through sometimes and sometimes
+    // they won't), so a more... consistent look is desirable.
+
+    // First render pass: depth buffer produced
+    GL11.glColorMask(false, false, false, false)
+    GL11.glDepthMask(true)
+    GL11.glDrawArrays(GL11.GL_QUADS, 0, (hologram.width + hologram.width + hologram.height) * 2 * 4)
+
+    // Second render pass: image produced
+    GL11.glColorMask(true, true, true, true)
+    GL11.glDepthFunc(GL11.GL_EQUAL)
+    GL11.glDrawArrays(GL11.GL_QUADS, 0, (hologram.width + hologram.width + hologram.height) * 2 * 4)
   }
 
   // ----------------------------------------------------------------------- //
@@ -317,12 +309,19 @@ object HologramRenderer extends TileEntitySpecialRenderer with Callable[Int] wit
   // ----------------------------------------------------------------------- //
 
   def call = {
-    val glBuffer = GL15.glGenBuffers()
+    RenderState.checkError(getClass.getName + ".call: entering (aka: wasntme)")
+    val holoTexture3D = GL11.glGenTextures()
+
+    GL11.glBindTexture(GL12.GL_TEXTURE_3D, holoTexture3D)
+    GL12.glTexImage3D(GL12.GL_TEXTURE_3D, 0, 4, hologram.texWidth, hologram.texHeight, hologram.texWidth, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, null.asInstanceOf[ByteBuffer])
+    GL11.glTexParameteri(GL12.GL_TEXTURE_3D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST)
+    GL11.glTexParameteri(GL12.GL_TEXTURE_3D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST)
+    RenderState.checkError(getClass.getName + ".call: leaving")
 
     // Force re-indexing.
     hologram.dirty = true
 
-    glBuffer
+    holoTexture3D
   }
 
   def onRemoval(e: RemovalNotification[TileEntity, Int]) {
