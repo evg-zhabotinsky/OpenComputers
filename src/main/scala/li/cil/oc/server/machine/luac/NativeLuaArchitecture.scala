@@ -312,7 +312,11 @@ abstract class NativeLuaArchitecture(val machine: api.machine.Machine) extends A
 
     apis.foreach(_.initialize())
 
-    lua.load(classOf[Machine].getResourceAsStream(Settings.scriptPath + "machine.lua"), "=machine", "t")
+    val custom = new java.io.File(net.minecraftforge.common.DimensionManager.getCurrentSaveRootDirectory,
+                                  Settings.savePath + "machine.lua")
+    lua.load(if (custom.exists && custom.isFile) new java.io.FileInputStream(custom)
+             else classOf[Machine].getResourceAsStream(Settings.scriptPath + "machine.lua"),
+             "=machine", "t")
     lua.newThread() // Left as the first value on the stack.
 
     true
