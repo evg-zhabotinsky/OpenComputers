@@ -39,16 +39,13 @@ local ipsCount = calcHookInterval()
 hookInterval = (ipsCount * 0.005)
 if hookInterval < 1000 then hookInterval = 1000 end
 
-local deadline = math.huge
-local hitDeadline = false
-local function checkDeadline()
-  if computer.realTime() > deadline then
-    debug.sethook(coroutine.running(), checkDeadline, "", 1)
-    if not hitDeadline then
-      deadline = deadline + 0.5
-    end
-    hitDeadline = true
-    error("too long without yielding", 0)
+local hardDeadline = math.huge
+local hookTriggered = nil
+local function checkHooks()
+  if hookTriggered then return end -- One hook at a time!
+  if computer.realTime() > hardDeadline then
+    hookTriggered = "hardDeadline"
+    return true
   end
 end
 
@@ -674,35 +671,50 @@ local function spcall(...)
   end
 end
 
-local sgcco
+--[[ Sysyields are expensive. If we do one due to a hard timeout and there is
+     a pending signal, receive it and store it here. The alternative would be
+     to implement a special sysyield that does not return signals, but
+     first, that would be more expensive computationally, and
+     second, if I'm not mistaken, the external event queue isn't counted
+     against machine's memory limit, and a hung computer might eat lots
+     of server's RAM if the queue isn't emptied regularly. Steadily draining
+     it to the Lua side will OOM the in-game computer instead.               ]]
+local signalQueueHead, signalQueueTail
 
-local function sgcf(self, gc)
-  while true do
-    self, gc = coroutine.yield(pcall(gc, self))
-  end
-end
-
-local function sgc(self)
-  local oldDeadline, oldHitDeadline = deadline, hitDeadline
-  local mt = debug.getmetatable(self)
-  mt = rawget(mt, "mt")
-  local gc = rawget(mt, "__gc")
-  if type(gc) ~= "function" then
-    return
-  end
-  if not sgcco then
-    sgcco = coroutine.create(sgcf)
-  end
-  debug.sethook(sgcco, checkDeadline, "", hookInterval)
-  deadline, hitDeadline = math.min(oldDeadline, computer.realTime() + 0.5), true
-  local _, result, reason = coroutine.resume(sgcco, self, gc)
-  debug.sethook(sgcco)
-  if coroutine.status(sgcco) == "dead" then
-    sgcco = nil
-  end
-  deadline, hitDeadline = oldDeadline, oldHitDeadline
-  if not result then
-    error(reason, 0)
+-- The custom code to resume user coroutines and handle sysyields and hooks
+local function resumeUserCoroutine(co, ...)
+  checkArg(1, co, "thread")
+  local args = table.pack(...)
+  while true do -- for consecutive sysyields and hookyields
+    debug.sethook(co, checkHooks, "y", hookInterval)
+    local result = table.pack(
+      coroutine.resume(co, table.unpack(args, 1, args.n)))
+    debug.sethook(co) -- avoid gc issues
+    args = nil -- clear to avoid persisting it
+    if coroutine.status(co) == "dead" then
+      -- Either return or error. Pass it through as is.
+      return table.unpack(result, 1, result.n)
+    end
+    -- Otherwise it was some kind of yield
+    if hookTriggered then -- It was a hook yield.
+      args = {n=0} -- No values shall be returned on resume
+      if hookTriggered == "hardDeadline" then
+        -- Hard deadline was hit, yielding the whole machine
+        coroutine.yield()
+      else -- Derp!
+        coroutine.yield() -- Master coroutine will kill the machine
+      end
+    elseif result[2] ~= nil then -- It was a sysyield
+      -- coroutine.yield(sysval) was called from machine.lua,
+      -- via either computer.pullSignal() or component.invoke().
+      -- Pass it on and out of Lua VM.
+      args = table.pack(coroutine.yield(result[2]))
+    else -- It was a user yield
+      -- coroutine.yield(nil, ...) was called from machine.lua,
+      -- probably by calling coroutine.yield(...) from user code.
+      -- Just return those (...) immediately.
+      return true, table.unpack(result, 3, result.n)
+    end
   end
 end
 
@@ -711,7 +723,7 @@ end
 -- parameter checks in those wrappers. This is to avoid errors from the host
 -- side that would push error objects - which are userdata and cannot be
 -- persisted.
-local sandbox, libprocess
+local sandbox
 sandbox = {
   assert = assert,
   dofile = nil, -- in boot/*_base.lua
@@ -721,12 +733,7 @@ sandbox = {
     if type(t) == "string" then -- don't allow messing with the string mt
       return nil
     end
-    local result = getmetatable(t)
-    -- check if we have a wrapped __gc using mt
-    if type(result) == "table" and system.allowGC() and rawget(result, "__gc") == sgc then
-      result = rawget(result, "mt")
-    end
-    return result
+    return getmetatable(t)
   end,
   ipairs = ipairs,
   load = function(ld, source, mode, env)
@@ -738,11 +745,7 @@ sandbox = {
   loadfile = nil, -- in boot/*_base.lua
   next = next,
   pairs = pairs,
-  pcall = function(...)
-    local result = table.pack(pcall(...))
-    checkDeadline()
-    return table.unpack(result, 1, result.n)
-  end,
+  pcall = pcall,
   print = nil, -- in boot/*_base.lua
   rawequal = rawequal,
   rawget = rawget,
@@ -750,35 +753,17 @@ sandbox = {
   rawset = rawset,
   select = select,
   setmetatable = function(t, mt)
-    if type(mt) ~= "table" then
+    if type(t) ~= "table" or type(mt) ~= "table" then
       return setmetatable(t, mt)
     end
-    if rawget(mt, "__gc") ~= nil then -- If __gc is set to ANYTHING not `nil`, we're gonna have issues
-      -- Garbage collector callbacks apparently can't be sandboxed after
-      -- all, because hooks are disabled while they're running. So we just
-      -- disable them altogether by default.
-      if system.allowGC() then
-        -- For all user __gc functions we enforce a much tighter deadline.
-        -- This is because these functions may be called from the main
-        -- thread under certain circumstanced (such as when saving the world),
-        -- which can lead to noticeable lag if the __gc function behaves badly.
-        local sbmt = {} -- sandboxed metatable. only for __gc stuff, so it's
-                        -- kinda ok to have a shallow copy instead... meh.
-        for k, v in next, mt do
-          sbmt[k] = v
-        end
-        sbmt.__gc = sgc
-        sbmt.mt = mt
-        mt = sbmt
-      else
-        -- Don't allow marking for finalization, but use the raw metatable.
-        local gc = rawget(mt, "__gc")
-        rawset(mt, "__gc", nil) -- remove __gc
-        local ret = table.pack(pcall(setmetatable, t, mt))
-        rawset(mt, "__gc", gc) -- restore __gc
-        if not ret[1] then error(ret[2], 0) end
-        return table.unpack(ret, 2, ret.n)
-      end
+    local gc = rawget(mt, "__gc")
+    if gc ~= nil then
+      -- Don't allow marking for finalization
+      rawset(mt, "__gc", nil) -- remove __gc temporarily for that
+      local ret = table.pack(pcall(setmetatable, t, mt))
+      rawset(mt, "__gc", gc) -- restore __gc
+      if not ret[1] then error(ret[2], 0) end
+      return table.unpack(ret, 2, ret.n)
     end
     return setmetatable(t, mt)
   end,
@@ -786,50 +771,24 @@ sandbox = {
   tostring = tostring,
   type = type,
   _VERSION = _VERSION:match("5.3") and "Lua 5.3" or "Lua 5.2",
-  xpcall = function(f, msgh, ...)
-    local handled = false
-    local result = table.pack(xpcall(f, function(...)
-      if handled then
-        return ...
-      else
-        handled = true
-        return msgh(...)
-      end
-    end, ...))
-    checkDeadline()
-    return table.unpack(result, 1, result.n)
+  xpcall = function(f, msgh, ...) -- Avoid too long xpcall loops
+    local iters = 3
+    return xpcall(f, function(...)
+      if iters <= 0 then return ... end
+      iters = iters - 1
+      return msgh(...)
+    end, ...)
   end,
 
   coroutine = {
     create = coroutine.create,
-    resume = function(co, ...) -- custom resume part for bubbling sysyields
-      checkArg(1, co, "thread")
-      local args = table.pack(...)
-      while true do -- for consecutive sysyields
-        debug.sethook(co, checkDeadline, "", hookInterval)
-        local result = table.pack(
-          coroutine.resume(co, table.unpack(args, 1, args.n)))
-        debug.sethook(co) -- avoid gc issues
-        checkDeadline()
-        if result[1] then -- success: (true, sysval?, ...?)
-          if coroutine.status(co) == "dead" then -- return: (true, ...)
-            return true, table.unpack(result, 2, result.n)
-          elseif result[2] ~= nil then -- yield: (true, sysval)
-            args = table.pack(coroutine.yield(result[2]))
-          else -- yield: (true, nil, ...)
-            return true, table.unpack(result, 3, result.n)
-          end
-        else -- error: result = (false, string)
-          return false, result[2]
-        end
-      end
-    end,
+    resume = resumeUserCoroutine,
     running = coroutine.running,
     status = coroutine.status,
     wrap = function(f) -- for bubbling coroutine.resume
       local co = coroutine.create(f)
       return function(...)
-        local result = table.pack(sandbox.coroutine.resume(co, ...))
+        local result = table.pack(resumeUserCoroutine(co, ...))
         if result[1] then
           return table.unpack(result, 2, result.n)
         else
@@ -1370,6 +1329,11 @@ local libcomputer = {
     return spcall(computer.pushSignal, ...)
   end,
   pullSignal = function(timeout)
+    if signalQueueHead then -- we already have pulled a signal
+      local signal = signalQueueHead
+      signalQueueHead = signal.l
+      return table.unpack(signal, 1, signal.n)
+    end
     local deadline = computer.uptime() +
       (type(timeout) == "number" and timeout or math.huge)
     repeat
@@ -1466,16 +1430,34 @@ end
 -------------------------------------------------------------------------------
 
 local function main()
+  local forceGC = 10
+  local co, args
+  local runner = coroutine.create(function()
+    -- This wrapper is required to avoid copy-pasting code from
+    -- resumeUserCoroutine with only marginal changes to it.
+    -- A single extra yield on each sysyield should not cause perf issues.
+    while true do
+      -- This call usually does not return, it yields instead.
+      local res, err = resumeUserCoroutine(co, table.unpack(args, 1, args.n))
+      -- Most likely, user code terminated.
+      if coroutine.status(co) == "dead" then
+        error(res and "computer halted" or err, 0)
+      end
+      -- The main coroutine of user used codecoroutine.yield() explicitly.
+      -- This should not happen normally, but it should behave like
+      -- computer.pullSignal() for backwards compatibility.
+      args = table.pack(libcomputer.pullSignal())
+    end
+  end)
+
   -- Yield once to get a memory baseline.
   coroutine.yield()
 
-  -- After memory footprint to avoid init.lua bumping the baseline.
-  local co, args = bootstrap()
-  local forceGC = 10
+  -- After memory footprint to avoid EEPROM code lua bumping the baseline.
+  co, args = bootstrap()
 
   while true do
-    deadline = computer.realTime() + system.timeout()
-    hitDeadline = false
+    hardDeadline, hookTriggered = computer.realTime() + system.timeout()
 
     -- NOTE: since this is run in an executor thread and we enforce timeouts
     -- in user-defined garbage collector callbacks this should be safe.
@@ -1487,16 +1469,34 @@ local function main()
       end
     end
 
-    debug.sethook(co, checkDeadline, "", hookInterval)
-    local result = table.pack(coroutine.resume(co, table.unpack(args, 1, args.n)))
+    local ok, result = coroutine.resume(runner, table.unpack(args, 1, args.n))
     args = nil -- clear upvalue, avoids trying to persist it
-    if not result[1] then
-      error(tostring(result[2]), 0)
-    elseif coroutine.status(co) == "dead" then
-      error("computer halted", 0)
+    if not ok then
+      error(result, 0) -- User code terminated
+    end
+    -- A sysyield happened
+    if hookTriggered then
+      if hookTriggered ~= "hardDeadline" then
+        -- Derp!
+        error("bad hook status", 0)
+      end
+      -- A hard deadline was hit, yield the machine
+      local signal = table.pack(coroutine.yield(0))
+      if signal.n > 0 then
+        -- Store the received signal for future use
+        signal = wrapUserdata(signal)
+        if signalQueueHead then
+          signalQueueTail.l = signal
+        else
+          signalQueueHead = signal
+        end
+        signalQueueTail = signal
+      end
+      args = {n=0}
     else
-      args = table.pack(coroutine.yield(result[2])) -- system yielded value
-      args = wrapUserdata(args)
+      -- A normal sysyield. Even if it is a pullSignal(), no need to touch the
+      -- signal queue, because pullSignal() would empty it first.
+      args = wrapUserdata(table.pack(coroutine.yield(result)))
     end
   end
 end
